@@ -75,6 +75,60 @@
         )
     )
 )
+
+;; Fund a loan (lender provides the loan amount)
+(define-public (fund-loan (loan-id uint))
+    (let ((loan (map-get? loans {loan-id: loan-id})))
+        (if (is-none loan)
+            ERR_INVALID_LOAN
+            (let ((loan-data (unwrap-panic loan)))
+                (if (not (is-eq (get lender loan-data) tx-sender))
+                    ERR_UNAUTHORIZED
+                    (if (not (is-eq (get status loan-data) STATUS_OPEN))
+                        ERR_ALREADY_FUNDED
+                        (begin
+                            (map-set loans
+                                {loan-id: loan-id}
+                                (merge loan-data {status: STATUS_FUNDED}))
+                            (print {event: "loan-funded", loan-id: loan-id, lender: tx-sender})
+                            (ok true)
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
+;; Make repayment on a loan
+(define-public (make-repayment (loan-id uint) (repayment-amount uint))
+    (let ((loan (map-get? loans {loan-id: loan-id})))
+        (if (is-none loan)
+            ERR_INVALID_LOAN
+            (let ((loan-data (unwrap-panic loan)))
+                (if (not (is-eq (get borrower loan-data) tx-sender))
+                    ERR_UNAUTHORIZED
+                    (if (not (is-eq (get status loan-data) STATUS_FUNDED))
+                        ERR_LOAN_NOT_OPEN
+                        (let ((current-repayment (get repayment loan-data))
+                              (total-repayment (+ current-repayment repayment-amount)))
+                            (begin
+                                (map-set loans
+                                    {loan-id: loan-id}
+                                    (merge loan-data {repayment: total-repayment}))
+                                (map-set repayments
+                                    {loan-id: loan-id}
+                                    {amount: repayment-amount, timestamp: block-height})
+                                (print {event: "repayment-made", loan-id: loan-id, borrower: tx-sender, amount: repayment-amount, total-repaid: total-repayment})
+                                (ok total-repayment)
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
 ;; block-loan
 ;; <add a description here>
 

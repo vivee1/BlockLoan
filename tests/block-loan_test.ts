@@ -876,3 +876,521 @@ Clarinet.test({
         assertEquals(timestamp > 0, true);
     },
 });
+
+// ========== COMMIT 4: LIQUIDATION, HEALTH MONITORING AND EDGE CASE TESTS ==========
+
+Clarinet.test({
+    name: "Test liquidate loan - successful liquidation of overdue loan",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const liquidator = accounts.get("wallet_3")!;
+        
+        // Create and fund loan with short deadline
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(5) // Very short deadline (5 blocks)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Mine blocks to pass deadline
+        chain.mineEmptyBlockUntil(10); // Mine until block 10, past deadline of 5
+        
+        // Liquidate the loan
+        let liquidationBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "liquidate-loan",
+                [types.uint(0)],
+                liquidator.address
+            ),
+        ]);
+        
+        assertEquals(liquidationBlock.receipts.length, 1);
+        liquidationBlock.receipts[0].result.expectOk();
+        
+        // Verify loan status is LIQUIDATED
+        let loanDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = loanDetails.result.expectSome().expectTuple() as any;
+        assertEquals(loan["status"], "u3"); // STATUS_LIQUIDATED
+    },
+});
+
+Clarinet.test({
+    name: "Test liquidate loan - cannot liquidate loan before deadline",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const liquidator = accounts.get("wallet_3")!;
+        
+        // Create and fund loan with future deadline
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100) // Deadline far in future
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Try to liquidate before deadline
+        let liquidationBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "liquidate-loan",
+                [types.uint(0)],
+                liquidator.address
+            ),
+        ]);
+        
+        assertEquals(liquidationBlock.receipts.length, 1);
+        liquidationBlock.receipts[0].result.expectErr().expectUint(ERR_LOAN_NOT_DUE);
+    },
+});
+
+Clarinet.test({
+    name: "Test liquidate loan - cannot liquidate unfunded loan",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const liquidator = accounts.get("wallet_3")!;
+        
+        // Create loan but don't fund it
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(5)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Mine blocks to pass deadline
+        chain.mineEmptyBlockUntil(10);
+        
+        // Try to liquidate unfunded loan
+        let liquidationBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "liquidate-loan",
+                [types.uint(0)],
+                liquidator.address
+            ),
+        ]);
+        
+        assertEquals(liquidationBlock.receipts.length, 1);
+        liquidationBlock.receipts[0].result.expectErr().expectUint(ERR_LOAN_NOT_FUNDED);
+    },
+});
+
+Clarinet.test({
+    name: "Test is-loan-overdue - correctly identifies overdue status",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Create and fund loan with short deadline
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(8) // Deadline at block 8
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Check not overdue initially
+        let overdueCheck1 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "is-loan-overdue",
+            [types.uint(0)],
+            deployer.address
+        );
+        assertEquals(overdueCheck1.result.expectBool(false), false);
+        
+        // Mine past deadline
+        chain.mineEmptyBlockUntil(12);
+        
+        // Check now overdue
+        let overdueCheck2 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "is-loan-overdue",
+            [types.uint(0)],
+            deployer.address
+        );
+        assertEquals(overdueCheck2.result.expectBool(true), true);
+    },
+});
+
+Clarinet.test({
+    name: "Test get-loan-progress - calculates repayment percentage",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000), // Total loan amount
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Check progress at 0% (no repayments)
+        let progress1 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan-progress",
+            [types.uint(0)],
+            deployer.address
+        );
+        progress1.result.expectUint(0); // 0%
+        
+        // Make 50% repayment
+        let repaymentBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(500)], // 50% of 1000
+                borrower.address
+            ),
+        ]);
+        repaymentBlock.receipts[0].result.expectOk();
+        
+        // Check progress at 50%
+        let progress2 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan-progress",
+            [types.uint(0)],
+            deployer.address
+        );
+        progress2.result.expectUint(50); // 50%
+        
+        // Make additional 30% repayment
+        let repaymentBlock2 = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(300)], // 30% more
+                borrower.address
+            ),
+        ]);
+        repaymentBlock2.receipts[0].result.expectOk();
+        
+        // Check progress at 80%
+        let progress3 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan-progress",
+            [types.uint(0)],
+            deployer.address
+        );
+        progress3.result.expectUint(80); // 80%
+    },
+});
+
+Clarinet.test({
+    name: "Test get-loan-health - assesses loan health status",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(50) // Deadline at block 50
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Check health of active funded loan
+        let health1 = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan-health",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let healthData1 = health1.result.expectTuple() as any;
+        // Should have some status (healthy/at-risk/inactive)
+        assertEquals(healthData1["progress"], "u0"); // 0% progress initially
+    },
+});
+
+Clarinet.test({
+    name: "Test edge case - complete workflow integration",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Complete loan lifecycle test
+        let fullWorkflow = chain.mineBlock([
+            // 1. Create loan
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(2000),
+                    types.uint(2500),
+                    types.principal(deployer.address),
+                    types.uint(200)
+                ],
+                borrower.address
+            ),
+            // 2. Deposit collateral
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "deposit-collateral",
+                [types.uint(0), types.uint(2500)],
+                borrower.address
+            ),
+            // 3. Fund loan
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+            // 4. Make partial repayment
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(1000)],
+                borrower.address
+            ),
+            // 5. Make final repayment
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(1000)],
+                borrower.address
+            ),
+            // 6. Complete loan
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "complete-repayment",
+                [types.uint(0)],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(fullWorkflow.receipts.length, 6);
+        
+        // Verify all operations succeeded
+        fullWorkflow.receipts.forEach((receipt, index) => {
+            receipt.result.expectOk();
+        });
+        
+        // Verify final loan state
+        let finalLoan = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = finalLoan.result.expectSome().expectTuple() as any;
+        assertEquals(loan["status"], "u2"); // STATUS_REPAID
+        assertEquals(loan["repayment"], "u2000"); // Full amount repaid
+    },
+});
+
+Clarinet.test({
+    name: "Test edge case - multiple loans with different states",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower1 = accounts.get("wallet_1")!;
+        const borrower2 = accounts.get("wallet_2")!;
+        const borrower3 = accounts.get("wallet_3")!;
+        const lender1 = accounts.get("wallet_4")!;
+        const lender2 = accounts.get("wallet_5")!;
+        const lender3 = accounts.get("wallet_6")!;
+        
+        // Create multiple loans in different states
+        let multiLoanBlock = chain.mineBlock([
+            // Loan 0: Create only (OPEN)
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender1.address),
+                    types.uint(1000), types.uint(1200),
+                    types.principal(deployer.address), types.uint(100)
+                ],
+                borrower1.address
+            ),
+            // Loan 1: Create and fund (FUNDED)
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender2.address),
+                    types.uint(2000), types.uint(2400),
+                    types.principal(deployer.address), types.uint(150)
+                ],
+                borrower2.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(1)],
+                lender2.address
+            ),
+            // Loan 2: Create, fund, and complete (REPAID)
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender3.address),
+                    types.uint(500), types.uint(600),
+                    types.principal(deployer.address), types.uint(80)
+                ],
+                borrower3.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(2)],
+                lender3.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(2), types.uint(500)],
+                borrower3.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "complete-repayment",
+                [types.uint(2)],
+                borrower3.address
+            ),
+        ]);
+        
+        assertEquals(multiLoanBlock.receipts.length, 7);
+        
+        // Verify loan counter
+        let counter = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan-counter",
+            [],
+            deployer.address
+        );
+        counter.result.expectUint(3);
+        
+        // Verify different loan states
+        let loan0 = chain.callReadOnlyFn(CONTRACT_NAME, "get-loan", [types.uint(0)], deployer.address);
+        let loan1 = chain.callReadOnlyFn(CONTRACT_NAME, "get-loan", [types.uint(1)], deployer.address);
+        let loan2 = chain.callReadOnlyFn(CONTRACT_NAME, "get-loan", [types.uint(2)], deployer.address);
+        
+        let l0 = loan0.result.expectSome().expectTuple() as any;
+        let l1 = loan1.result.expectSome().expectTuple() as any;
+        let l2 = loan2.result.expectSome().expectTuple() as any;
+        
+        assertEquals(l0["status"], "u0"); // OPEN
+        assertEquals(l1["status"], "u1"); // FUNDED
+        assertEquals(l2["status"], "u2"); // REPAID
+    },
+});

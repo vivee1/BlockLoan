@@ -477,3 +477,402 @@ Clarinet.test({
         fundBlock.receipts[0].result.expectErr().expectUint(ERR_INVALID_LOAN);
     },
 });
+
+// ========== COMMIT 3: REPAYMENT AND LOAN COMPLETION TESTS ==========
+
+Clarinet.test({
+    name: "Test make repayment - successful partial repayment",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup: Create and fund loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000), // loan amount
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 2);
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Make partial repayment
+        let repaymentBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [
+                    types.uint(0), // loan ID
+                    types.uint(300) // partial payment
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(repaymentBlock.receipts.length, 1);
+        repaymentBlock.receipts[0].result.expectOk().expectUint(300); // Returns total repaid
+        
+        // Verify loan repayment amount updated
+        let loanDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = loanDetails.result.expectSome().expectTuple() as any;
+        assertEquals(loan["repayment"], "u300");
+    },
+});
+
+Clarinet.test({
+    name: "Test make repayment - multiple repayments accumulate",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup: Create and fund loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(2000), // loan amount
+                    types.uint(2400),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Make multiple repayments
+        let repaymentBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(500)], // First payment
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(750)], // Second payment
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(200)], // Third payment
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(repaymentBlock.receipts.length, 3);
+        repaymentBlock.receipts[0].result.expectOk().expectUint(500);  // Total: 500
+        repaymentBlock.receipts[1].result.expectOk().expectUint(1250); // Total: 1250
+        repaymentBlock.receipts[2].result.expectOk().expectUint(1450); // Total: 1450
+        
+        // Verify final repayment amount
+        let loanDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = loanDetails.result.expectSome().expectTuple() as any;
+        assertEquals(loan["repayment"], "u1450");
+    },
+});
+
+Clarinet.test({
+    name: "Test make repayment - unauthorized user cannot repay",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const unauthorized = accounts.get("wallet_3")!;
+        
+        // Setup: Create and fund loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        
+        // Try to make repayment as unauthorized user
+        let repaymentBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(500)],
+                unauthorized.address // Wrong user
+            ),
+        ]);
+        
+        assertEquals(repaymentBlock.receipts.length, 1);
+        repaymentBlock.receipts[0].result.expectErr().expectUint(ERR_UNAUTHORIZED);
+    },
+});
+
+Clarinet.test({
+    name: "Test make repayment - cannot repay unfunded loan",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Create loan but don't fund it
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Try to make repayment on unfunded loan
+        let repaymentBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(500)],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(repaymentBlock.receipts.length, 1);
+        repaymentBlock.receipts[0].result.expectErr().expectUint(ERR_LOAN_NOT_OPEN);
+    },
+});
+
+Clarinet.test({
+    name: "Test complete repayment - successful completion",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup: Create, fund, and fully repay loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000), // loan amount
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(1000)], // Full repayment
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 3);
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        setupBlock.receipts[2].result.expectOk();
+        
+        // Complete the loan
+        let completionBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "complete-repayment",
+                [types.uint(0)],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(completionBlock.receipts.length, 1);
+        completionBlock.receipts[0].result.expectOk();
+        
+        // Verify loan status is now REPAID
+        let loanDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = loanDetails.result.expectSome().expectTuple() as any;
+        assertEquals(loan["status"], "u2"); // STATUS_REPAID
+    },
+});
+
+Clarinet.test({
+    name: "Test complete repayment - insufficient repayment fails",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup: Create, fund, and partially repay loan
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000), // loan amount
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(800)], // Partial repayment
+                borrower.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        setupBlock.receipts[2].result.expectOk();
+        
+        // Try to complete with insufficient repayment
+        let completionBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "complete-repayment",
+                [types.uint(0)],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(completionBlock.receipts.length, 1);
+        completionBlock.receipts[0].result.expectErr().expectUint(ERR_INSUFFICIENT_REPAYMENT);
+    },
+});
+
+Clarinet.test({
+    name: "Test get repayment details - verify repayment tracking",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Setup: Create, fund, and make repayment
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "make-repayment",
+                [types.uint(0), types.uint(600)],
+                borrower.address
+            ),
+        ]);
+        
+        setupBlock.receipts[0].result.expectOk();
+        setupBlock.receipts[1].result.expectOk();
+        setupBlock.receipts[2].result.expectOk();
+        
+        // Get repayment details
+        let repaymentDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-repayment",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let repayment = repaymentDetails.result.expectSome().expectTuple() as any;
+        assertEquals(repayment["amount"], "u600");
+        // Timestamp should be a positive block height
+        const timestamp = parseInt(repayment["timestamp"].replace('u', ''));
+        assertEquals(timestamp > 0, true);
+    },
+});

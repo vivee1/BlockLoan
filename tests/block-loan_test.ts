@@ -184,3 +184,296 @@ Clarinet.test({
         assertEquals(blockHeight > 0, true);
     },
 });
+
+// ========== COMMIT 2: COLLATERAL DEPOSIT AND LOAN FUNDING TESTS ==========
+
+Clarinet.test({
+    name: "Test collateral deposit - successful deposit",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // First create a loan
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200), // collateral required
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(createBlock.receipts.length, 1);
+        createBlock.receipts[0].result.expectOk();
+        
+        // Now deposit collateral
+        let depositBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "deposit-collateral",
+                [
+                    types.uint(0), // loan ID
+                    types.uint(1200) // deposit exact collateral amount
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(depositBlock.receipts.length, 1);
+        depositBlock.receipts[0].result.expectOk();
+    },
+});
+
+Clarinet.test({
+    name: "Test collateral deposit - insufficient collateral fails",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Create a loan
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1500), // collateral required
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Try to deposit insufficient collateral
+        let depositBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "deposit-collateral",
+                [
+                    types.uint(0), // loan ID
+                    types.uint(1000) // insufficient amount
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        assertEquals(depositBlock.receipts.length, 1);
+        depositBlock.receipts[0].result.expectErr().expectUint(ERR_COLLATERAL_LOW);
+    },
+});
+
+Clarinet.test({
+    name: "Test collateral deposit - unauthorized user fails",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const unauthorized = accounts.get("wallet_3")!;
+        
+        // Create a loan
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Try to deposit collateral as unauthorized user
+        let depositBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "deposit-collateral",
+                [
+                    types.uint(0),
+                    types.uint(1200)
+                ],
+                unauthorized.address // Wrong user
+            ),
+        ]);
+        
+        assertEquals(depositBlock.receipts.length, 1);
+        depositBlock.receipts[0].result.expectErr().expectUint(ERR_UNAUTHORIZED);
+    },
+});
+
+Clarinet.test({
+    name: "Test loan funding - successful funding by lender",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Create loan
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Fund the loan
+        let fundBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)], // loan ID
+                lender.address
+            ),
+        ]);
+        
+        assertEquals(fundBlock.receipts.length, 1);
+        fundBlock.receipts[0].result.expectOk();
+        
+        // Verify loan status changed to FUNDED
+        let loanDetails = chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-loan",
+            [types.uint(0)],
+            deployer.address
+        );
+        
+        let loan = loanDetails.result.expectSome().expectTuple() as any;
+        assertEquals(loan["status"], "u1"); // STATUS_FUNDED
+    },
+});
+
+Clarinet.test({
+    name: "Test loan funding - unauthorized user cannot fund",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        const unauthorized = accounts.get("wallet_3")!;
+        
+        // Create loan
+        let createBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+        ]);
+        
+        createBlock.receipts[0].result.expectOk();
+        
+        // Try to fund as unauthorized user
+        let fundBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                unauthorized.address // Wrong user
+            ),
+        ]);
+        
+        assertEquals(fundBlock.receipts.length, 1);
+        fundBlock.receipts[0].result.expectErr().expectUint(ERR_UNAUTHORIZED);
+    },
+});
+
+Clarinet.test({
+    name: "Test loan funding - cannot fund already funded loan",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const borrower = accounts.get("wallet_1")!;
+        const lender = accounts.get("wallet_2")!;
+        
+        // Create and fund loan
+        let initialBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-loan",
+                [
+                    types.principal(lender.address),
+                    types.uint(1000),
+                    types.uint(1200),
+                    types.principal(deployer.address),
+                    types.uint(100)
+                ],
+                borrower.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        assertEquals(initialBlock.receipts.length, 2);
+        initialBlock.receipts[0].result.expectOk();
+        initialBlock.receipts[1].result.expectOk();
+        
+        // Try to fund again
+        let refundBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(0)],
+                lender.address
+            ),
+        ]);
+        
+        assertEquals(refundBlock.receipts.length, 1);
+        refundBlock.receipts[0].result.expectErr().expectUint(ERR_ALREADY_FUNDED);
+    },
+});
+
+Clarinet.test({
+    name: "Test loan funding - invalid loan ID fails",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const lender = accounts.get("wallet_2")!;
+        
+        // Try to fund non-existent loan
+        let fundBlock = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "fund-loan",
+                [types.uint(999)], // Non-existent loan
+                lender.address
+            ),
+        ]);
+        
+        assertEquals(fundBlock.receipts.length, 1);
+        fundBlock.receipts[0].result.expectErr().expectUint(ERR_INVALID_LOAN);
+    },
+});
